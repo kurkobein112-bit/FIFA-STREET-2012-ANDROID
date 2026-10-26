@@ -1,0 +1,34 @@
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..287616d 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -441,13 +441,26 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   if (vulkan_instance->extensions_.ext_KHR_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+   }
+-  if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
+-#include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
+-  }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
+ #undef XE_UI_VULKAN_FUNCTION
+ 
++  if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
++    bool debug_utils_loaded = true;
++#define XE_UI_VULKAN_FUNCTION(name)                                                   \
++    debug_utils_loaded &=                                                           \
++        (ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, #name))) != \
++        nullptr;
++#include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
++#undef XE_UI_VULKAN_FUNCTION
++    // Some Android loaders advertise debug utils without providing its entry points.
++    // All uses are guarded by this flag; required rendering functions still fail below.
++    if (!debug_utils_loaded) {
++      vulkan_instance->extensions_.ext_EXT_debug_utils = false;
++      REXLOG_WARN("VK_EXT_debug_utils entry points unavailable; debug utilities disabled");
++    }
++  }
++
+   if (!functions_loaded) {
+     REXLOG_ERROR("Failed to get all Vulkan instance function pointers");
+     return nullptr;

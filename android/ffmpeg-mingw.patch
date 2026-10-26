@@ -1,0 +1,14 @@
+diff --git a/libavutil/internal.h b/libavutil/internal.h
+index 2ed1c2a..adb159d 100644
+--- a/libavutil/internal.h
++++ b/libavutil/internal.h
+@@ -178,7 +178,9 @@ void avpriv_request_sample(void *avc,
+                            const char *msg, ...) av_printf_format(2, 3);
+ 
+ #if HAVE_LIBC_MSVCRT
++#if !defined(__MINGW32__)
+ #include <crtversion.h>
++#endif
+ #if defined(_VC_CRT_MAJOR_VERSION) && _VC_CRT_MAJOR_VERSION < 14
+ #pragma comment(linker, "/include:" EXTERN_PREFIX "avpriv_strtod")
+ #pragma comment(linker, "/include:" EXTERN_PREFIX "avpriv_snprintf")

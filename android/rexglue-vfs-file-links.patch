@@ -1,0 +1,32 @@
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -192,12 +192,27 @@
+   return parent->Delete(entry);
+ }
+ 
+-X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view path,
++X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view input_path,
+                                      FileDisposition creation_disposition, uint32_t desired_access,
+                                      bool is_directory, bool is_non_directory, File** out_file,
+                                      FileAction* out_action) {
+   // TODO(gibbed): should 'is_directory' remain as a bool or should it be
+   // flipped to a generic FileAttributeFlags?
++  std::string_view path = input_path;
++
++  // Resolve full-file links before splitting into parent and basename.
++  // Otherwise GetChild bypasses a redirect registered for the file itself.
++  std::string redirected_path;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    const auto full_path = root_entry
++        ? root_entry->absolute_path() + "\\" + std::string(path)
++        : std::string(path);
++    if (ResolveSymbolicLink(rex::string::utf8_canonicalize_guest_path(full_path), redirected_path)) {
++      path = redirected_path;
++      root_entry = nullptr;
++    }
++  }
+ 
+   // Cleanup access.
+   if (desired_access & FileAccess::kGenericRead) {

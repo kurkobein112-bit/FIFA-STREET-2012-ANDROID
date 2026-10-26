@@ -1,0 +1,361 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -48,6 +48,8 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/fence_wait_timing.h>
+ #include <rex/ui/vulkan/util.h>
++
++REXCVAR_DECLARE(bool, log_frame_stats);
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_BOOL(vulkan_readback_short_wait, false, "GPU/Vulkan",
+@@ -3103,6 +3105,24 @@
+ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+   assert_true(submission_open_);
+   SplitPendingBarrier();
++  if (REXCVAR_GET(log_frame_stats)) {
++    static uint64_t buffer_breaks = 0, image_breaks = 0, forced_breaks = 0, shared_breaks = 0;
++    static auto window = std::chrono::steady_clock::now();
++    if (in_render_pass_) {
++      buffer_breaks += !pending_barriers_buffer_memory_barriers_.empty();
++      image_breaks += !pending_barriers_image_memory_barriers_.empty();
++      forced_breaks += pending_barriers_.empty() && force_end_render_pass;
++      for (const auto& barrier : pending_barriers_buffer_memory_barriers_) {
++        if (barrier.buffer == shared_memory_->buffer()) { ++shared_breaks; break; }
++      }
++    }
++    if (std::chrono::steady_clock::now() - window >= std::chrono::seconds(5)) {
++      REXGPU_INFO("Render breaks: buffer={} shared={} image={} forced={}",
++                  buffer_breaks, shared_breaks, image_breaks, forced_breaks);
++      buffer_breaks = image_breaks = forced_breaks = shared_breaks = 0;
++      window = std::chrono::steady_clock::now();
++    }
++  }
+   if (pending_barriers_.empty()) {
+     if (force_end_render_pass) {
+       EndRenderPass();
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <array>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -23,6 +24,8 @@
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
+ #include <rex/graphics/vulkan/dirty_render_area.h>
+ #include <rex/math.h>
++
++REXCVAR_DECLARE(bool, log_frame_stats);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_trim_render_area, false, "GPU/Vulkan",
+                     "Limit attachment load/store to the union of draw scissors and clears")
+@@ -127,6 +130,8 @@
+   size_t stream_remaining = command_stream_.size();
+   VkPipeline graphics_pipeline = VK_NULL_HANDLE, compute_pipeline = VK_NULL_HANDLE;
+   uint32_t profile_pass = UINT32_MAX;
++  static uint64_t passes = 0, draws = 0, copies = 0, dispatches = 0, copy_bytes = 0;
++  static auto stats_window = std::chrono::steady_clock::now();
+   while (stream_remaining) {
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+@@ -155,6 +160,7 @@
+     }
+     switch (header.command) {
+       case Command::kVkBeginRenderPass: {
++        ++passes;
+         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
+         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);
+         VkRenderPassBeginInfo render_pass_begin_info;
+@@ -251,7 +257,11 @@
+       } break;
+ 
+       case Command::kVkCopyBuffer: {
++        ++copies;
+         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
++        const auto* regions = reinterpret_cast<const VkBufferCopy*>(
++            reinterpret_cast<const uint8_t*>(stream) + rex::align(sizeof(args), alignof(VkBufferCopy)));
++        for (uint32_t i = 0; i < args.region_count; ++i) copy_bytes += regions[i].size;
+         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
+                             reinterpret_cast<const VkBufferCopy*>(
+                                 reinterpret_cast<const uint8_t*>(stream) +
+@@ -276,18 +286,21 @@
+       } break;
+ 
+       case Command::kVkDispatch: {
++        ++dispatches;
+         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
+         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
+                           args.group_count_z);
+       } break;
+ 
+       case Command::kVkDraw: {
++        ++draws;
+         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
+                       args.first_instance);
+       } break;
+ 
+       case Command::kVkDrawIndexed: {
++        ++draws;
+         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
+                              args.first_index, args.vertex_offset, args.first_instance);
+@@ -303,6 +316,7 @@
+         break;
+ 
+       case Command::kVkBeginRendering: {
++        ++passes;
+         auto& args = *reinterpret_cast<const ArgsVkBeginRendering*>(stream);
+         size_t offset_bytes =
+             rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
+@@ -449,6 +463,13 @@
+     stream += header.arguments_size_elements;
+     stream_remaining -= header.arguments_size_elements;
+   }
++  if (REXCVAR_GET(log_frame_stats) &&
++      std::chrono::steady_clock::now() - stats_window >= std::chrono::seconds(5)) {
++    REXGPU_INFO("Render work: passes={} draws={} copies={} copyMB={:.2f} dispatches={}",
++                passes, draws, copies, double(copy_bytes) / 1048576.0, dispatches);
++    passes = draws = copies = copy_bytes = dispatches = 0;
++    stats_window = std::chrono::steady_clock::now();
++  }
+ }
+ 
+ void DeferredCommandBuffer::CmdVkPipelineBarrier(
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -90,6 +90,7 @@
+ }
+ 
+ void SharedMemory::InvalidateAllPages() {
++  InvalidateUploadCache(0, kBufferSize >> page_size_log2_);
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
+@@ -106,6 +107,7 @@
+ }
+ 
+ void SharedMemory::ClearCache() {
++  InvalidateUploadCache(0, kBufferSize >> page_size_log2_);
+   // Keeping GPU-written data, so "invalidated by GPU".
+   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+   // No watches now, so no references to the pools accessible by guest threads -
+@@ -262,6 +264,7 @@
+   uint32_t end = start + length - 1;
+   uint32_t page_first = start >> page_size_log2_;
+   uint32_t page_last = end >> page_size_log2_;
++  InvalidateUploadCache(page_first, page_last - page_first + 1);
+ 
+   // Trigger modification callbacks so, for instance, resolved data is loaded to
+   // the texture.
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -102,6 +102,7 @@
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
+  protected:
++  virtual void InvalidateUploadCache(uint32_t first_page, uint32_t page_count) {}
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+   void InitializeCommon();
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ #include <utility>
+ #include <vector>
+@@ -26,6 +27,10 @@
+ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++REXCVAR_DEFINE_BOOL(vulkan_cache_cpu_uploads, false, "GPU/Vulkan",
++                    "Skip byte-identical CPU uploads using a bounded 16 MiB cache")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -170,6 +175,7 @@
+ }
+ 
+ void VulkanSharedMemory::Shutdown(bool from_destructor) {
++  upload_cache_.reset();
+   upload_buffer_pool_.reset();
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -273,12 +279,49 @@
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  std::vector<std::pair<uint32_t, uint32_t>> changed_ranges;
++  const auto* ranges = &upload_page_ranges;
++  if (REXCVAR_GET(vulkan_cache_cpu_uploads)) {
++    if (!upload_cache_) upload_cache_ = std::make_unique<UploadPageCache>(size_t(1) << page_size_log2());
++    static uint64_t checked_pages = 0, reused_pages = 0;
++    static auto window = std::chrono::steady_clock::now();
++    for (const auto& range : upload_page_ranges) {
++      for (uint32_t page = range.first; page < range.first + range.second; ++page) {
++        ++checked_pages;
++        const uint32_t address = page << page_size_log2();
++        const uint32_t page_size = uint32_t(1) << page_size_log2();
++        const void* source = memory().TranslatePhysical(address);
++        if (upload_cache_->Matches(page, source)) {
++          // Rearm write watches before rechecking, so later guest writes invalidate residency.
++          MakeRangeValid(address, page_size, false);
++          if (upload_cache_->Matches(page, source)) {
++            ++reused_pages;
++            continue;
++          }
++          MemoryInvalidationCallback(address, page_size, true);
++        }
++        if (!changed_ranges.empty() && changed_ranges.back().first + changed_ranges.back().second == page)
++          ++changed_ranges.back().second;
++        else
++          changed_ranges.emplace_back(page, 1);
++      }
++    }
++    if (std::chrono::steady_clock::now() - window >= std::chrono::seconds(5)) {
++      REXGPU_INFO("CPU upload cache: checked_pages={} reused_pages={}", checked_pages, reused_pages);
++      checked_pages = reused_pages = 0;
++      window = std::chrono::steady_clock::now();
++    }
++    if (changed_ranges.empty()) return true;
++    ranges = &changed_ranges;
++  } else {
++    upload_cache_.reset();
++  }
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+   Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
++      std::make_pair(ranges->front().first << page_size_log2(),
++                     (ranges->back().first + ranges->back().second -
++                      ranges->front().first)
+                          << page_size_log2()));
+   command_processor_.SubmitBarriers(true);
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+@@ -286,7 +329,7 @@
+   bool successful = true;
+   upload_regions_.clear();
+   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
+-  for (auto upload_range : upload_page_ranges) {
++  for (auto upload_range : *ranges) {
+     uint32_t upload_range_start = upload_range.first;
+     uint32_t upload_range_length = upload_range.second;
+     while (upload_range_length) {
+@@ -304,6 +347,10 @@
+       std::memcpy(upload_buffer_mapping,
+                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                   upload_buffer_size);
++      if (upload_cache_) {
++        for (uint32_t offset = 0; offset < upload_buffer_size; offset += uint32_t(1) << page_size_log2())
++          upload_cache_->Store(upload_range_start + (offset >> page_size_log2()), upload_buffer_mapping + offset);
++      }
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include <rex/graphics/shared_memory.h>
++#include <rex/graphics/vulkan/upload_page_cache.h>
+ #include <rex/memory.h>
+ #include <rex/ui/vulkan/upload_buffer_pool.h>
+ 
+@@ -50,6 +51,9 @@
+   VkBuffer buffer() const { return buffer_; }
+ 
+  protected:
++  void InvalidateUploadCache(uint32_t first_page, uint32_t page_count) override {
++    if (upload_cache_) upload_cache_->Invalidate(first_page, page_count);
++  }
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                         uint32_t length_allocations) override;
+ 
+@@ -72,6 +76,7 @@
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
++  std::unique_ptr<UploadPageCache> upload_cache_;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/include/rex/graphics/vulkan/upload_page_cache.h b/include/rex/graphics/vulkan/upload_page_cache.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/graphics/vulkan/upload_page_cache.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++namespace rex::graphics::vulkan {
++
++// Bounded, exact snapshots of CPU uploads. Collisions evict, never alias pages.
++class UploadPageCache {
++ public:
++  explicit UploadPageCache(size_t page_size, size_t budget = 16 * 1024 * 1024)
++      : page_size_(page_size), slots_(std::max(size_t(1), budget / page_size)) {}
++
++  bool Matches(uint32_t page, const void* bytes) const {
++    const auto& slot = slots_[page % slots_.size()];
++    return slot.valid && slot.page == page &&
++           std::memcmp(slot.bytes.get(), bytes, page_size_) == 0;
++  }
++
++  void Store(uint32_t page, const void* bytes) {
++    auto& slot = slots_[page % slots_.size()];
++    if (!slot.bytes) slot.bytes = std::make_unique<uint8_t[]>(page_size_);
++    std::memcpy(slot.bytes.get(), bytes, page_size_);
++    slot.page = page;
++    slot.valid = true;
++  }
++
++  void Invalidate(uint32_t first, uint32_t count) {
++    if (count >= slots_.size()) {
++      for (auto& slot : slots_) {
++        if (slot.valid && slot.page >= first && uint64_t(slot.page) - first < count)
++          slot.valid = false;
++      }
++    } else {
++      for (uint64_t page = first; page < uint64_t(first) + count; ++page) {
++        auto& slot = slots_[page % slots_.size()];
++        if (slot.valid && slot.page == page) slot.valid = false;
++      }
++    }
++  }
++
++ private:
++  struct Slot {
++    std::unique_ptr<uint8_t[]> bytes;
++    uint32_t page = 0;
++    bool valid = false;
++  };
++  size_t page_size_;
++  std::vector<Slot> slots_;
++};
++
++}  // namespace rex::graphics::vulkan

@@ -1,0 +1,245 @@
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -44,9 +44,17 @@
+ 
+ #if REX_PLATFORM_ANDROID
+ #include <dlfcn.h>
++#include <fstream>
++#include <sys/resource.h>
++#include <rex/cvar.h>
++#include <rex/thread/android_placement.h>
+ 
+ #include <rex/main_android.h>
+ #include <rex/string.h>
++
++REXCVAR_DEFINE_INT32(android_thread_placement, 0, "CPU/Android",
++                    "Experimental placement: 0 Android scheduler, 1 guest Main/Render, 2 Skate-style critical/background")
++    .range(0, 2).lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ #endif
+ 
+ #if REX_PLATFORM_LINUX
+@@ -65,6 +73,67 @@
+ namespace rex::thread {
+ 
+ #if REX_PLATFORM_ANDROID
++static void ResetAndroidInheritedPlacement() {
++  if (!REXCVAR_GET(android_thread_placement)) return;
++  cpu_set_t original, inherited;
++  CPU_ZERO(&original);
++  CPU_ZERO(&inherited);
++  if (sched_getaffinity(getpid(), sizeof(original), &original) != 0 ||
++      sched_getaffinity(0, sizeof(inherited), &inherited) != 0) return;
++  if (CPU_EQUAL(&original, &inherited)) return;
++  // A pinned guest parent must not accidentally pin all of its job workers.
++  // Do this before publishing thread startup, so a parent's explicit set_name
++  // or set_affinity_mask after WaitStarted still takes precedence.
++  if (sched_setaffinity(0, sizeof(original), &original) != 0)
++    REXSYS_WARN("Android inherited placement reset rejected: tid={} errno={}", gettid(), errno);
++}
++
++static void ApplyAndroidThreadPlacement(pthread_t thread, std::string_view name) {
++  const int mode = REXCVAR_GET(android_thread_placement);
++  const int role = AndroidThreadPlacementRole(name, mode);
++  if (!role) return;
++  static const auto ceilings = [] {
++    std::array<uint64_t, 64> values{};
++    for (unsigned cpu = 0; cpu < values.size(); ++cpu) {
++      std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
++                         "/cpufreq/cpuinfo_max_freq");
++      file >> values[cpu];
++    }
++    return values;
++  }();
++  const pid_t tid = pthread_gettid_np(thread);
++  cpu_set_t available;
++  CPU_ZERO(&available);
++  if (sched_getaffinity(getpid(), sizeof(available), &available) != 0) {
++    REXSYS_WARN("Android placement unavailable: name={} tid={} errno={}", name, tid, errno);
++    return;
++  }
++  uint64_t allowed = 0;
++  for (unsigned cpu = 0; cpu < 64; ++cpu)
++    if (CPU_ISSET(cpu, &available)) allowed |= uint64_t(1) << cpu;
++  const auto clusters = SelectAndroidCpuClusters(ceilings, allowed);
++  const uint64_t mask = role > 0 ? clusters.fast : clusters.slow;
++  if (!mask) {
++    REXSYS_INFO("Android placement unchanged: name={} tid={} allowed={:X}", name, tid, allowed);
++    return;
++  }
++  cpu_set_t requested;
++  CPU_ZERO(&requested);
++  for (unsigned cpu = 0; cpu < 64; ++cpu)
++    if (mask & (uint64_t(1) << cpu)) CPU_SET(cpu, &requested);
++  if (sched_setaffinity(tid, sizeof(requested), &requested) != 0) {
++    REXSYS_WARN("Android placement rejected: name={} tid={} mask={:X} errno={}", name, tid, mask, errno);
++    return;
++  }
++  if (role < 0) {
++    errno = 0;
++    const int priority = getpriority(PRIO_PROCESS, tid);
++    if (!errno && priority < 5 && setpriority(PRIO_PROCESS, tid, 5) != 0)
++      REXSYS_WARN("Android background nice rejected: name={} tid={} errno={}", name, tid, errno);
++  }
++  REXSYS_INFO("Android placement applied: mode={} name={} tid={} mask={:X}", mode, name, tid, mask);
++}
++
+ // May be null if no dynamically loaded functions are required.
+ static void* android_libc_;
+ // API 26+.
+@@ -741,6 +810,7 @@
+ #endif
+ #if REX_PLATFORM_ANDROID
+       SetAndroidPreApi26Name(name);
++      ApplyAndroidThreadPlacement(thread_, name);
+ #endif
+     }
+   }
+@@ -1399,6 +1469,9 @@
+ thread_local PosixThread* current_thread_ = nullptr;
+ 
+ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
++#if REX_PLATFORM_ANDROID
++  ResetAndroidInheritedPlacement();
++#endif
+ #if !REX_PLATFORM_ANDROID
+   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
+     assert_always();
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -253,6 +253,13 @@
+   DestroyAllTextures();
+ }
+ 
++REXCVAR_DEFINE_INT32(texture_cache_eviction_budget, 0, "GPU",
++                    "Maximum soft-limit texture evictions per cleanup, 0 unlimited")
++    .range(0, 4096);
++REXCVAR_DEFINE_INT32(texture_cache_eviction_budget_ms, 0, "GPU",
++                    "Soft-limit texture cleanup time budget in ms, 0 unlimited")
++    .range(0, 50);
++
+ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+   // If memory usage is too high, destroy unused textures.
+   uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+@@ -268,11 +275,20 @@
+       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
+   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
+   bool destroyed_any = false;
++  uint32_t evicted = 0;
++  const uint32_t eviction_budget = REXCVAR_GET(texture_cache_eviction_budget);
++  const uint64_t eviction_budget_ms = REXCVAR_GET(texture_cache_eviction_budget_ms);
+   while (texture_used_first_ != nullptr) {
+     uint64_t total_host_memory_usage_mb =
+         (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
+     bool limit_hard_exceeded = total_host_memory_usage_mb > limit_hard_mb;
+     if (total_host_memory_usage_mb <= limit_soft_mb && !limit_hard_exceeded) {
++      break;
++    }
++    // Hard pressure must still reclaim safe resources rather than defer an OOM.
++    if (!limit_hard_exceeded && evicted &&
++        ((eviction_budget && evicted >= eviction_budget) ||
++         (eviction_budget_ms && rex::chrono::Clock::QueryHostUptimeMillis() - current_time >= eviction_budget_ms))) {
+       break;
+     }
+     Texture* texture = texture_used_first_;
+@@ -297,6 +313,7 @@
+     if (found_texture_it != textures_.end()) {
+       assert_true(found_texture_it->second.get() == texture);
+       textures_.erase(found_texture_it);
++      ++evicted;
+       // `texture` is invalid now.
+     }
+   }
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -5404,6 +5404,16 @@
+       using ProfileEntry = std::pair<std::pair<uint32_t, uint64_t>, std::pair<double, uint64_t>>;
+       std::vector<std::pair<double, ProfileEntry>> sorted;
+       for (const auto& op : timing_commands_) sorted.emplace_back(op.second.first, op);
++      std::map<uint32_t, std::pair<double, uint64_t>> kind_totals;
++      for (const auto& op : timing_commands_) {
++        auto& total = kind_totals[op.first.first];
++        total.first += op.second.first;
++        total.second += op.second.second;
++      }
++      for (const auto& total : kind_totals) {
++        REXGPU_INFO("GPU profile kind total kind={} total={:.2f}ms calls={}",
++                    total.first, total.second.first, total.second.second);
++      }
+       std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+       for (size_t i = 0; i < std::min(size_t(8), sorted.size()); ++i) {
+         const auto& op = sorted[i].second;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -3593,6 +3593,10 @@
+   }
+ }
+ 
++REXCVAR_DEFINE_INT32(vulkan_deferred_pipeline_destroy_budget, 0, "GPU/Vulkan",
++                    "Maximum completed retired pipelines destroyed per cleanup, 0 unlimited")
++    .range(0, 4096);
++
+ void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
+   std::vector<VkPipeline> pipelines_to_destroy;
+   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+@@ -3603,6 +3607,8 @@
+     }
+     auto it = deferred_destroy_pipelines_.begin();
+     while (it != deferred_destroy_pipelines_.end()) {
++      const uint32_t budget = REXCVAR_GET(vulkan_deferred_pipeline_destroy_budget);
++      if (!force_all && budget && pipelines_to_destroy.size() >= budget) break;
+       if (force_all || it->first <= completed_submission) {
+         pipelines_to_destroy.push_back(it->second);
+         it = deferred_destroy_pipelines_.erase(it);
+diff --git a/include/rex/thread/android_placement.h b/include/rex/thread/android_placement.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/thread/android_placement.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <array>
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <string_view>
++
++namespace rex::thread {
++
++struct AndroidCpuClusters { uint64_t fast = 0, slow = 0; };
++
++inline AndroidCpuClusters SelectAndroidCpuClusters(
++    const std::array<uint64_t, 64>& ceilings, uint64_t allowed) {
++  uint64_t lowest = std::numeric_limits<uint64_t>::max(), highest = 0;
++  for (unsigned cpu = 0; cpu < 64; ++cpu) {
++    if (!(allowed & (uint64_t(1) << cpu))) continue;
++    if (!ceilings[cpu]) return {};
++    lowest = std::min(lowest, ceilings[cpu]);
++    highest = std::max(highest, ceilings[cpu]);
++  }
++  if (!highest || highest == lowest) return {};
++  AndroidCpuClusters result;
++  for (unsigned cpu = 0; cpu < 64; ++cpu) {
++    const uint64_t bit = uint64_t(1) << cpu;
++    if (!(allowed & bit)) continue;
++    (ceilings[cpu] == lowest ? result.slow : result.fast) |= bit;
++  }
++  return result;
++}
++
++// Mode 1 protects the two guest frame producers; mode 2 also places GPU/audio
++// and background workers, following Skate's division by thread name.
++inline int AndroidThreadPlacementRole(std::string_view name, int mode) {
++  if (!mode) return 0;
++  if (name.starts_with("Main XThread") || name.starts_with("RenderThread (")) return 1;
++  if (mode < 2) return 0;
++  for (auto prefix : {"GPU Commands", "Kernel Dispatch", "Audio Worker", "RwAudioCore"})
++    if (name.starts_with(prefix)) return 1;
++  for (auto prefix : {"XMA Decoder", "rwfilesys", "load_thread", "presence_thread"})
++    if (name.starts_with(prefix)) return -1;
++  return 0;
++}
++}  // namespace rex::thread

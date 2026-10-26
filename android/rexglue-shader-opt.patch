@@ -1,0 +1,117 @@
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -321,6 +321,15 @@
+     set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+     add_subdirectory(spirv-headers)
++
++    if(ANDROID)
++        set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spirv-headers")
++        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
++        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
++        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
++        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
++        add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
++    endif()
+ 
+     add_library(spirv-tools-headers INTERFACE)
+     target_include_directories(spirv-tools-headers SYSTEM INTERFACE
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -139,6 +139,10 @@
+ )
+ 
+ if(REXGLUE_USE_VULKAN)
++    if(ANDROID)
++        target_link_libraries(rexgpu-xenos PRIVATE SPIRV-Tools-opt)
++        target_compile_definitions(rexgpu-xenos PRIVATE REX_VULKAN_SPIRV_OPTIMIZER=1)
++    endif()
+     target_link_libraries(rexgpu-xenos PRIVATE
+         Vulkan::Headers
+         glslang::SPIRV
+diff --git a/src/graphics/vulkan/shader.cpp b/src/graphics/vulkan/shader.cpp
+--- a/src/graphics/vulkan/shader.cpp
++++ b/src/graphics/vulkan/shader.cpp
+@@ -15,6 +15,14 @@
+ #include <rex/graphics/vulkan/shader.h>
+ #include <rex/logging.h>
+ #include <rex/ui/vulkan/provider.h>
++
++#if defined(REX_VULKAN_SPIRV_OPTIMIZER)
++#include <rex/cvar.h>
++#include <spirv-tools/optimizer.hpp>
++REXCVAR_DEFINE_BOOL(vulkan_optimize_spirv, false, "GPU/Vulkan",
++                   "Optimize translated shaders before driver compilation")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -42,6 +50,43 @@
+   shader_module_create_info.flags = 0;
+   shader_module_create_info.codeSize = translated_binary().size();
+   shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(translated_binary().data());
++#if defined(REX_VULKAN_SPIRV_OPTIMIZER)
++  std::vector<uint32_t> optimized;
++  if (REXCVAR_GET(vulkan_optimize_spirv)) {
++    const auto& properties = vulkan_device->properties();
++    const spv_target_env environment =
++        properties.apiVersion >= VK_API_VERSION_1_3 ? SPV_ENV_VULKAN_1_3 :
++        properties.apiVersion >= VK_API_VERSION_1_2 ? SPV_ENV_VULKAN_1_2 :
++        properties.apiVersion >= VK_API_VERSION_1_1 ?
++            (vulkan_device->extensions().ext_1_2_KHR_spirv_1_4 ?
++                 SPV_ENV_VULKAN_1_1_SPIRV_1_4 : SPV_ENV_VULKAN_1_1) : SPV_ENV_VULKAN_1_0;
++    spvtools::Optimizer optimizer(environment);
++    optimizer.SetMessageConsumer(
++        [](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
++          REXGPU_WARN("SPIR-V optimizer: {}", message);
++        });
++    optimizer.RegisterPerformancePasses(true);
++    spvtools::ValidatorOptions validation_options;
++    validation_options.SetUniformBufferStandardLayout(properties.uniformBufferStandardLayout);
++    validation_options.SetScalarBlockLayout(properties.scalarBlockLayout);
++    spvtools::OptimizerOptions options;
++    options.set_validator_options(validation_options);
++    options.set_preserve_bindings(true);
++    options.set_preserve_spec_constants(true);
++    spvtools::SpirvTools validator(environment);
++    validator.SetMessageConsumer(optimizer.consumer());
++    if (optimizer.Run(shader_module_create_info.pCode, shader_module_create_info.codeSize / sizeof(uint32_t),
++                      &optimized, options) &&
++        validator.Validate(optimized.data(), optimized.size(), validation_options)) {
++      REXGPU_INFO("SPIR-V optimized {:016X}: {} -> {} bytes", shader().ucode_data_hash(),
++                  shader_module_create_info.codeSize, optimized.size() * sizeof(uint32_t));
++      shader_module_create_info.codeSize = optimized.size() * sizeof(uint32_t);
++      shader_module_create_info.pCode = optimized.data();
++    } else {
++      REXGPU_WARN("SPIR-V optimization failed for {:016X}; using original shader", shader().ucode_data_hash());
++    }
++  }
++#endif
+   if (vulkan_device->functions().vkCreateShaderModule(vulkan_device->device(),
+                                                       &shader_module_create_info, nullptr,
+                                                       &shader_module_) != VK_SUCCESS) {
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -223,7 +223,8 @@
+     uint32_t vertex_index_reset;
+     // Number of guest vertices processed by the memexport compute dispatch.
+     uint32_t compute_memexport_vertex_count;
+-    float user_clip_planes[6][4];
++    // The uniform block uses std140 vec4 arrays, including after scalar additions.
++    alignas(16) float user_clip_planes[6][4];
+ 
+     float ndc_scale[3];
+     float point_vertex_diameter_min;
+@@ -241,7 +242,7 @@
+ 
+     // Each byte contains post-swizzle TextureSign values for each of the needed
+     // components of each of the 32 used texture fetch constants.
+-    uint32_t texture_swizzled_signs[8];
++    alignas(16) uint32_t texture_swizzled_signs[8];
+ 
+     // If the imageViewFormatSwizzle portability subset is not supported, the
+     // component swizzle (taking both guest and host swizzles into account) to
